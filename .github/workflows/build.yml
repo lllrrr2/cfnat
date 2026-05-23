@@ -10,12 +10,12 @@ permissions:
   contents: write
 
 jobs:
-  build-linux:
-    name: Build ${{ matrix.name }}
+  build-linux-glibc:
+    name: Build ${{ matrix.name }} glibc dynamic
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix:
         include:
           - name: linux-amd64
@@ -23,148 +23,94 @@ jobs:
             packages: gcc libc6-dev
             cc: gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-386
             artifact: cfnat-linux-386
             packages: gcc-i686-linux-gnu libc6-dev-i386-cross
             cc: i686-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-armv5
             artifact: cfnat-linux-armv5
             packages: gcc-arm-linux-gnueabi libc6-dev-armel-cross
             cc: arm-linux-gnueabi-gcc
             cflags: "-march=armv5te"
-            ldflags: "-static"
-            use_zig: false
           - name: linux-armv6
             artifact: cfnat-linux-armv6
             packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
             cc: arm-linux-gnueabihf-gcc
             cflags: "-marm -march=armv6 -mfpu=vfp -mfloat-abi=hard"
-            ldflags: "-static"
-            use_zig: false
           - name: linux-armv7
             artifact: cfnat-linux-armv7
             packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
             cc: arm-linux-gnueabihf-gcc
             cflags: "-marm -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
-            ldflags: "-static"
-            use_zig: false
           - name: linux-arm64
             artifact: cfnat-linux-arm64
             packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             cc: aarch64-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-mips
             artifact: cfnat-linux-mips
             packages: gcc-mips-linux-gnu libc6-dev-mips-cross
             cc: mips-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-mipsel
             artifact: cfnat-linux-mipsel
             packages: gcc-mipsel-linux-gnu libc6-dev-mipsel-cross
             cc: mipsel-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-mips64
             artifact: cfnat-linux-mips64
             packages: gcc-mips64-linux-gnuabi64 libc6-dev-mips64-cross
             cc: mips64-linux-gnuabi64-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-mips64el
             artifact: cfnat-linux-mips64el
             packages: gcc-mips64el-linux-gnuabi64 libc6-dev-mips64el-cross
             cc: mips64el-linux-gnuabi64-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-ppc64
             artifact: cfnat-linux-ppc64
             packages: gcc-powerpc64-linux-gnu libc6-dev-ppc64-cross
             cc: powerpc64-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-ppc64le
             artifact: cfnat-linux-ppc64le
             packages: gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross
             cc: powerpc64le-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-riscv64
             artifact: cfnat-linux-riscv64
             packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
             cc: riscv64-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
           - name: linux-s390x
             artifact: cfnat-linux-s390x
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross
             cc: s390x-linux-gnu-gcc
             cflags: ""
-            ldflags: "-static"
-            use_zig: false
-          - name: linux-loongarch64
-            artifact: cfnat-linux-loongarch64
-            packages: ""
-            cc: zig cc
-            zig_target: loongarch64-linux-musl
-            cflags: ""
-            ldflags: "-static"
-            use_zig: true
-            experimental: true
     env:
       SOURCE_FILE: cfnat_linux.c
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
       - name: Install cross compiler
-        if: ${{ !matrix.use_zig }}
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ matrix.packages }} file ca-certificates
-      - name: Setup Zig for loongarch64
-        if: ${{ matrix.use_zig }}
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
-      - name: Install common tools for Zig build
-        if: ${{ matrix.use_zig }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends file ca-certificates
-      - name: Build Linux
+      - name: Build Linux glibc dynamic
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
-          if [ "${{ matrix.use_zig }}" = "true" ]; then
-            zig cc -target ${{ matrix.zig_target }} -O2 -pipe -std=c11 \
-              -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
-              "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
-              -pthread ${{ matrix.ldflags }} -s
-          else
-            ${{ matrix.cc }} -O2 -pipe -std=c11 \
-              -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
-              "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
-              -pthread ${{ matrix.ldflags }} -s
-          fi
+          ${{ matrix.cc }} -O2 -pipe -std=c11 \
+            -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
+            "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
+            -pthread -s
           chmod +x "dist/${{ matrix.artifact }}"
           file "dist/${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v7
@@ -172,7 +118,81 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
-          archive: false
+
+  build-linux-musl:
+    name: Build ${{ matrix.name }} musl static
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - name: linux-amd64-musl
+            artifact: cfnat-linux-amd64-musl
+            zig_target: x86_64-linux-musl
+            cflags: ""
+          - name: linux-386-musl
+            artifact: cfnat-linux-386-musl
+            zig_target: x86-linux-musl
+            cflags: ""
+          - name: linux-armv6-musl
+            artifact: cfnat-linux-armv6-musl
+            zig_target: arm-linux-musleabihf
+            cflags: "-mcpu=arm1176jzf_s"
+          - name: linux-armv7-musl
+            artifact: cfnat-linux-armv7-musl
+            zig_target: arm-linux-musleabihf
+            cflags: "-mcpu=cortex_a7"
+          - name: linux-arm64-musl
+            artifact: cfnat-linux-arm64-musl
+            zig_target: aarch64-linux-musl
+            cflags: ""
+          - name: linux-mips-musl
+            artifact: cfnat-linux-mips-musl
+            zig_target: mips-linux-musleabi
+            cflags: ""
+          - name: linux-mipsel-musl
+            artifact: cfnat-linux-mipsel-musl
+            zig_target: mipsel-linux-musleabi
+            cflags: ""
+          - name: linux-riscv64-musl
+            artifact: cfnat-linux-riscv64-musl
+            zig_target: riscv64-linux-musl
+            cflags: ""
+    env:
+      SOURCE_FILE: cfnat_linux.c
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+      - name: Install common tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file ca-certificates
+      - name: Build Linux musl static
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
+          zig cc -target ${{ matrix.zig_target }} -O2 -pipe -std=c11 \
+            -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
+            "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
+            -pthread -static -s
+          chmod +x "dist/${{ matrix.artifact }}"
+          file "dist/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
 
   build-windows:
     name: Build ${{ matrix.name }}
@@ -193,6 +213,9 @@ jobs:
       SOURCE_FILE: cfnat_windows.c
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
       - name: Install MinGW-w64
         shell: bash
         run: |
@@ -207,16 +230,16 @@ jobs:
           if [ ! -f "$SOURCE_FILE" ]; then echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2; exit 1; fi
           ${{ matrix.cc }} \
             -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0601 \
+            -finput-charset=UTF-8 -fexec-charset=UTF-8 \
             -Wall -Wextra -Wno-unused-parameter \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
-            -lws2_32 -lwinpthread -static -s
+            -lws2_32 -ldnsapi -lwininet -lwinpthread -static -s
           file "dist/${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
-          archive: false
 
   build-macos:
     name: Build ${{ matrix.name }}
@@ -237,6 +260,9 @@ jobs:
       SOURCE_FILE: cfnat_macos.c
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
       - name: Build macOS
         shell: bash
         run: |
@@ -257,16 +283,18 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
           if-no-files-found: error
-          archive: false
 
   release:
     name: Publish release
-    needs: [build-linux, build-windows, build-macos]
+    needs: [build-linux-glibc, build-linux-musl, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -280,14 +308,15 @@ jobs:
             name="$(basename "$file")"
             cp "$file" "package/bin/$name"
             cp "$file" "release/$name"
-            case "$name" in *.exe) ;;
-              *)
-                chmod +x "package/bin/$name"
-                chmod +x "release/$name"
-                ;;
+            case "$name" in
+              *.exe) ;;
+              *) chmod +x "package/bin/$name" "release/$name" ;;
             esac
           done
-          cp cfnat_linux.c cfnat_macos.c cfnat_windows.c README.md ips-v4 ips-v6 locations package/
+          cp cfnat_linux.c cfnat_macos.c cfnat_windows.c README.md package/
+          if [ -f ips-v4.txt ]; then cp ips-v4.txt package/; fi
+          if [ -f ips-v6.txt ]; then cp ips-v6.txt package/; fi
+          if [ -f locations.json ]; then cp locations.json package/; fi
           (cd package && zip -r ../release/cfnat-release.zip .)
           ls -lh package
           ls -lh release
