@@ -68,13 +68,10 @@ Cloudflare 优选 IP:443 或 :80
 - 候选 IP 按延迟和丢包率综合评分，始终使用当前 score 最低的最优 IP。
 - 默认启用候选缓存，二次启动时先快速健康检查缓存 IP，命中后立即监听，再后台刷新。
 - 单端口同时承接 TLS 与非 TLS / HTTP 流量。
-- 根据客户端首字节自动分流到 `-port` 或 `-http-port`。
 - 支持定时健康检查与失败自动切换。
 - 支持百度前置代理。
 - 支持运营商分池监听，可按移动、电信、联通分别建立监听入口。
 - 单一 `cfnat.c` 源码通过条件编译同时支持 Linux / macOS / Windows。
-- Linux / macOS 使用 `pthread` + POSIX/BSD socket，并内置轻量 DNS TXT 查询，避免依赖 glibc resolver 静态链接。
-- Windows 在同一源码内使用 Winsock2 + Windows DNS API + MinGW-w64 `winpthread`，控制台输出通过 `WriteConsoleW` 直接写入 Unicode，兼容 Windows 7 中文显示。
 - 统一日志级别：`silent`、`error`、`warn`、`info`、`debug`。
 
 ---
@@ -175,25 +172,7 @@ TLS 流量           → Cloudflare IP:443
 | `-health-log` | 健康检查成功日志输出间隔，单位秒；设为 `0` 可关闭成功日志 | `60` |
 | `-log` | 日志级别：`silent`、`error`、`warn`、`info`、`debug` | `info` |
 | `-baidu-proxy` | 是否启用百度前置代理 | `false` |
-| `-carrier-listens` | 运营商分池监听配置 | 空 |
-
-### 已固定为源码常量的项目
-
-为了减少参数污染，以下配置不再作为命令行参数暴露，而是放在 `cfnat.c` 顶部：
-
-| 配置 | 源码常量 |
-| --- | --- |
-| 百度前置代理域名 | `DEFAULT_BAIDU_DOMAIN` |
-| 百度前置代理端口 | `DEFAULT_BAIDU_PORT` |
-| 百度代理扫描目标 | `DEFAULT_BAIDU_SCAN_TARGET` |
-| 每个百度代理池保留节点数 | `DEFAULT_BAIDU_IPNUM` |
-| 运营商解析器配置 | `DEFAULT_CARRIER_RESOLVERS` |
-
-需要调整这些值时，直接修改 `cfnat.c` 顶部的默认常量：
-
-```text
-cfnat.c
-```
+| `-carrier-listens` | 运营商分池监听配置；使用后会自动强制启用 `-baidu-proxy=true` | 空 |
 
 ---
 
@@ -239,9 +218,10 @@ cfnat.c
 
 ```bash
 ./cfnat-linux \
-  -baidu-proxy=true \
   -carrier-listens="mobile=0.0.0.0:1234,telecom=0.0.0.0:1235,unicom=0.0.0.0:1236"
 ```
+
+使用 `-carrier-listens` 后，程序会自动按分端口模式启用百度前置代理；即使用户显式设置 `-baidu-proxy=false`，也会以 `-carrier-listens` 为准。
 
 分池模式下，可以给不同运营商分配不同本地入口：
 
@@ -439,6 +419,8 @@ Cloudflare IP
 ### 运营商分池
 
 启用 `-carrier-listens` 后，程序可以按运营商建立独立监听入口和独立候选池。
+
+只要配置了 `-carrier-listens`，程序会自动强制启用 `-baidu-proxy=true`。也就是说，`-carrier-listens` 的优先级高于 `-baidu-proxy`，分端口模式始终走百度前置代理分池。
 
 示例：
 

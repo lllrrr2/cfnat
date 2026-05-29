@@ -467,7 +467,7 @@ static void usage(const char *p) {
     printf("  -random=value             是否随机生成IP (default true)\n");
     printf("  -task=value               扫描线程数 (default 100)\n");
     printf("  -baidu-proxy=value        是否启用百度前置代理 (default false)\n");
-    printf("  -carrier-listens=value    运营商分池监听，例如 mobile=0.0.0.0:1234,telecom=0.0.0.0:1235\n");
+    printf("  -carrier-listens=value    运营商分池监听，例如 mobile=0.0.0.0:1234,telecom=0.0.0.0:1235,unicom=0.0.0.0:1236\n");
 }
 
 static int parse_bool(const char *v) {
@@ -544,6 +544,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (c->task > 512) c->task = 512;
     if (c->baidu_port <= 0) c->baidu_port = 443;
     if (c->baidu_ipnum <= 0) c->baidu_ipnum = 12;
+    if (c->carrier_listens[0]) c->use_baidu_proxy = 1;
 }
 
 static int file_exists(const char *path) {
@@ -2448,6 +2449,9 @@ int main(int argc, char **argv) {
     }
 #endif
     parse_args(&g_cfg, argc, argv);
+    if (g_cfg.carrier_listens[0]) {
+        log_msg("检测到 -carrier-listens，已自动启用 -baidu-proxy=true，运营商分池以分端口入口为准");
+    }
     install_signals();
     const char *ipfile = g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt";
     const char **urls = g_cfg.ips_type == 6 ? IPS_V6_URLS : IPS_V4_URLS;
