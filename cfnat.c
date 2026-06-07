@@ -5,7 +5,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <windns.h>
 #include <wininet.h>
 #include <io.h>
 #include <locale.h>
@@ -71,8 +70,6 @@ static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
 static const int DEFAULT_BAIDU_PORT = 443;
 static const char *DEFAULT_BAIDU_SCAN_TARGET = "myip.ipip.net:80";
 static const int DEFAULT_BAIDU_IPNUM = 12;
-static const char *DEFAULT_CARRIER_RESOLVERS = "";
-
 static const char *IPS_V4_URLS[] = {
     "https://cdn.jsdelivr.net/gh/fscarmen/cfnat@main/ips-v4.txt",
     "https://raw.githubusercontent.com/fscarmen/cfnat/main/ips-v4.txt",
@@ -101,10 +98,11 @@ typedef enum {
 } LogLevel;
 
 typedef struct {
-    char addr[64], colo[128], domain[256], log_name[16];
-    char baidu_domain[MAX_DOMAIN_LEN], baidu_scan_target[MAX_ADDR_LEN], carrier_listens[256], carrier_resolvers[512];
+    char colo[128], domain[256], log_name[16];
+    char baidu_domain[MAX_DOMAIN_LEN], baidu_scan_target[MAX_ADDR_LEN];
+    char direct_listen[MAX_ADDR_LEN], baidu_listen[MAX_ADDR_LEN];
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
-    int use_baidu_proxy, baidu_port, baidu_ipnum;
+    int baidu_port, baidu_ipnum;
     LogLevel log_level;
 } Config;
 
@@ -146,15 +144,10 @@ typedef struct {
 } ScanCtx;
 
 typedef struct {
-    char carrier[MAX_NAME_LEN];
+    char mode[MAX_NAME_LEN];
     char addr[MAX_ADDR_LEN];
+    int use_baidu_proxy;
 } CarrierListenSpec;
-
-typedef struct {
-    char carrier[MAX_NAME_LEN];
-    char addrs[16][MAX_RESOLVER_LEN];
-    size_t len;
-} CarrierResolverSpec;
 
 typedef struct {
     char addr[MAX_ADDR_LEN];
@@ -183,6 +176,7 @@ typedef struct {
     int tls_port, http_port, num, delay_ms;
     char ip[MAX_IP_LEN];
     BaiduProxyPool *proxy_pool;
+    int use_mixed; // 1 表示混合模式
 } ConnCtx;
 
 typedef struct {
@@ -455,7 +449,8 @@ static int sleep_interruptible_ms(int ms) {
 
 static void usage(const char *p) {
     printf("Usage of %s:\n", p);
-    printf("  -addr=value               本地监听的 IP 和端口 (default 0.0.0.0:1234)\n");
+    printf("  -direct-listen=value      直连优选监听地址，例如 0.0.0.0:1234\n");
+    printf("  -baidu-listen=value       百度前置优选监听地址，例如 0.0.0.0:1235\n");
     printf("  -colo=value               筛选数据中心例如 HKG,SJC,LAX\n");
     printf("  -delay=value              有效延迟毫秒 (default 300)\n");
     printf("  -ipnum=value              提取的有效IP数量 (default 20)\n");
@@ -466,8 +461,6 @@ static void usage(const char *p) {
     printf("  -http-port=value          非TLS/HTTP 转发目标端口 (default 80)\n");
     printf("  -random=value             是否随机生成IP (default true)\n");
     printf("  -task=value               扫描线程数 (default 100)\n");
-    printf("  -baidu-proxy=value        是否启用百度前置代理 (default false)\n");
-    printf("  -carrier-listens=value    运营商分池监听，例如 mobile=0.0.0.0:1234,telecom=0.0.0.0:1235,unicom=0.0.0.0:1236\n");
 }
 
 static int parse_bool(const char *v) {
@@ -476,12 +469,10 @@ static int parse_bool(const char *v) {
 
 static void cfg_defaults(Config *c) {
     memset(c, 0, sizeof(*c));
-    strcpy(c->addr, "0.0.0.0:1234");
     strcpy(c->domain, "cloudflaremirrors.com/debian");
     strcpy(c->log_name, "info");
     strcpy(c->baidu_domain, DEFAULT_BAIDU_DOMAIN);
     strcpy(c->baidu_scan_target, DEFAULT_BAIDU_SCAN_TARGET);
-    strcpy(c->carrier_resolvers, DEFAULT_CARRIER_RESOLVERS);
     c->code = 200;
     c->delay_ms = 300;
     c->ipnum = 20;
@@ -492,7 +483,6 @@ static void cfg_defaults(Config *c) {
     c->random_mode = 1;
     c->task = 100;
     c->health_log = 60;
-    c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
     c->log_level = LOG_INFO;
@@ -515,7 +505,8 @@ static void parse_args(Config *c, int argc, char **argv) {
             *eq = 0;
             val = eq + 1;
         } else if (i + 1 < argc && argv[i + 1][0] != '-') val = argv[++i];
-        if (!strcmp(key, "addr") && val) snprintf(c->addr, sizeof(c->addr), "%s", val);
+        if (!strcmp(key, "direct-listen") && val) snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
+        else if (!strcmp(key, "baidu-listen") && val) snprintf(c->baidu_listen, sizeof(c->baidu_listen), "%s", val);
         else if (!strcmp(key, "code") && val) c->code = atoi(val);
         else if (!strcmp(key, "colo") && val) snprintf(c->colo, sizeof(c->colo), "%s", val);
         else if (!strcmp(key, "delay") && val) c->delay_ms = atoi(val);
@@ -534,8 +525,6 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "random")) c->random_mode = parse_bool(val);
         else if (!strcmp(key, "task") && val) c->task = atoi(val);
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
-        else if (!strcmp(key, "baidu-proxy")) c->use_baidu_proxy = parse_bool(val);
-        else if (!strcmp(key, "carrier-listens") && val) snprintf(c->carrier_listens, sizeof(c->carrier_listens), "%s", val);
     }
     if (c->delay_ms <= 0) c->delay_ms = 300;
     if (c->ipnum <= 0) c->ipnum = 20;
@@ -544,7 +533,6 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (c->task > 512) c->task = 512;
     if (c->baidu_port <= 0) c->baidu_port = 443;
     if (c->baidu_ipnum <= 0) c->baidu_ipnum = 12;
-    if (c->carrier_listens[0]) c->use_baidu_proxy = 1;
 }
 
 static int file_exists(const char *path) {
@@ -988,31 +976,11 @@ static int str_eq_ci(const char *a, const char *b) {
     return a && b && strcasecmp(a, b) == 0;
 }
 
-static const char *carrier_display_name(const char *carrier) {
-    if (str_eq_ci(carrier, "mobile")) return "中国移动";
-    if (str_eq_ci(carrier, "telecom")) return "中国电信";
-    if (str_eq_ci(carrier, "unicom")) return "中国联通";
-    return carrier ? carrier : "unknown";
-}
-
-static int normalize_carrier(const char *value, char *out, size_t outsz) {
-    if (!value || !out || outsz == 0) return -1;
-    if (!strcasecmp(value, "mobile") || !strcasecmp(value, "cmcc") || !strcasecmp(value, "china-mobile") || !strcmp(value, "移动") ||
-            !strcmp(value, "中国移动")) {
-        snprintf(out, outsz, "mobile");
-        return 0;
-    }
-    if (!strcasecmp(value, "telecom") || !strcasecmp(value, "ct") || !strcasecmp(value, "chinanet") || !strcasecmp(value, "china-telecom") ||
-            !strcmp(value, "电信") || !strcmp(value, "中国电信")) {
-        snprintf(out, outsz, "telecom");
-        return 0;
-    }
-    if (!strcasecmp(value, "unicom") || !strcasecmp(value, "cu") || !strcasecmp(value, "cuc") || !strcasecmp(value, "china-unicom") ||
-            !strcmp(value, "联通") || !strcmp(value, "中国联通")) {
-        snprintf(out, outsz, "unicom");
-        return 0;
-    }
-    return -1;
+static const char *carrier_display_name(const char *mode) {
+    if (str_eq_ci(mode, "direct")) return "直连优选";
+    if (str_eq_ci(mode, "baidu")) return "百度前置优选";
+    if (str_eq_ci(mode, "mixed")) return "混合优选";
+    return mode ? mode : "unknown";
 }
 
 static void append_unique_addr(StringList *list, const char *value) {
@@ -1021,257 +989,6 @@ static void append_unique_addr(StringList *list, const char *value) {
         if (!strcmp(list->items[i], value)) return;
     }
     strlist_add(list, value);
-}
-
-#ifdef _WIN32
-static int lookup_txt_first(const char *name, char *out, size_t outsz) {
-    PDNS_RECORD rec = NULL;
-    DNS_STATUS st = DnsQuery_A(name, DNS_TYPE_TEXT, DNS_QUERY_STANDARD, NULL, &rec, NULL);
-    if (st != 0 || !rec) return -1;
-    int rc = -1;
-    for (PDNS_RECORD cur = rec; cur; cur = cur->pNext) {
-        if (cur->wType != DNS_TYPE_TEXT) continue;
-        if (cur->Data.TXT.dwStringCount == 0) continue;
-        const char *txt = cur->Data.TXT.pStringArray[0];
-        if (!txt || !*txt) continue;
-        snprintf(out, outsz, "%s", txt);
-        rc = 0;
-        break;
-    }
-    DnsRecordListFree(rec, DnsFreeRecordList);
-    return rc;
-}
-
-#else
-static int read_first_nameserver(char *out, size_t outsz) {
-    FILE *f = fopen("/etc/resolv.conf", "r");
-    if (!f) {
-        snprintf(out, outsz, "1.1.1.1");
-        return 0;
-    }
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        trim_line(line);
-        if (strncmp(line, "nameserver", 10) != 0) continue;
-        char *p = line + 10;
-        while (*p == ' ' || *p == '	') p++;
-        if (!*p || strchr(p, ':')) continue;
-        char *e = p;
-        while (*e && *e != ' ' && *e != '	') e++;
-        *e = '\0';
-        if (outsz > 0) {
-            size_t copy_len = strlen(p);
-            if (copy_len >= outsz) copy_len = outsz - 1;
-            memcpy(out, p, copy_len);
-            out[copy_len] = '\0';
-        }
-        fclose(f);
-        return 0;
-    }
-    fclose(f);
-    snprintf(out, outsz, "1.1.1.1");
-    return 0;
-}
-
-static int dns_encode_name(const char *name, unsigned char *buf, size_t bufsz, size_t *off) {
-    const char *p = name;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        size_t len = dot ? (size_t)(dot - p) : strlen(p);
-        if (len == 0 || len > 63 || *off + 1 + len >= bufsz) return -1;
-        buf[(*off)++] = (unsigned char)len;
-        memcpy(buf + *off, p, len);
-        *off += len;
-        if (!dot) break;
-        p = dot + 1;
-    }
-    if (*off >= bufsz) return -1;
-    buf[(*off)++] = 0;
-    return 0;
-}
-
-static int dns_skip_name(const unsigned char *buf, size_t len, size_t *off) {
-    size_t p = *off;
-    while (p < len) {
-        unsigned char c = buf[p++];
-        if (c == 0) {
-            *off = p;
-            return 0;
-        }
-        if ((c & 0xC0) == 0xC0) {
-            if (p >= len) return -1;
-            p++;
-            *off = p;
-            return 0;
-        }
-        if ((c & 0xC0) != 0 || p + c > len) return -1;
-        p += c;
-    }
-    return -1;
-}
-
-static int lookup_txt_first(const char *name, char *out, size_t outsz) {
-    if (!name || !out || outsz == 0) return -1;
-    out[0] = '\0';
-
-    unsigned char query[512];
-    memset(query, 0, sizeof(query));
-    unsigned short id = (unsigned short)((now_ms() ^ (long)getpid()) & 0xffff);
-    query[0] = (unsigned char)(id >> 8);
-    query[1] = (unsigned char)(id & 0xff);
-    query[2] = 0x01;
-    query[5] = 0x01;
-    size_t qlen = 12;
-    if (dns_encode_name(name, query, sizeof(query), &qlen) != 0) return -1;
-    if (qlen + 4 > sizeof(query)) return -1;
-    query[qlen++] = 0x00;
-    query[qlen++] = 0x10;
-    query[qlen++] = 0x00;
-    query[qlen++] = 0x01;
-
-    char ns[64];
-    read_first_nameserver(ns, sizeof(ns));
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (cfnat_socket_invalid(fd)) return -1;
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(53);
-    if (inet_pton(AF_INET, ns, &sa.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
-
-    if (sendto(fd, query, qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    struct timeval tv = {2, 0};
-    int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-    if (rc <= 0) {
-        close(fd);
-        return -1;
-    }
-
-    unsigned char answer[4096];
-    ssize_t n = recvfrom(fd, answer, sizeof(answer), 0, NULL, NULL);
-    close(fd);
-    if (n < 12) return -1;
-    size_t len = (size_t)n;
-    if (answer[0] != query[0] || answer[1] != query[1]) return -1;
-    if ((answer[3] & 0x0f) != 0) return -1;
-
-    unsigned int qd = ((unsigned int)answer[4] << 8) | answer[5];
-    unsigned int an = ((unsigned int)answer[6] << 8) | answer[7];
-    size_t off = 12;
-    for (unsigned int i = 0; i < qd; i++) {
-        if (dns_skip_name(answer, len, &off) != 0 || off + 4 > len) return -1;
-        off += 4;
-    }
-
-    for (unsigned int i = 0; i < an; i++) {
-        if (dns_skip_name(answer, len, &off) != 0 || off + 10 > len) return -1;
-        unsigned int type = ((unsigned int)answer[off] << 8) | answer[off + 1];
-        unsigned int klass = ((unsigned int)answer[off + 2] << 8) | answer[off + 3];
-        unsigned int rdlen = ((unsigned int)answer[off + 8] << 8) | answer[off + 9];
-        off += 10;
-        if (off + rdlen > len) return -1;
-        if (type == 16 && klass == 1 && rdlen > 1) {
-            size_t pos = off;
-            size_t end = off + rdlen;
-            size_t used = 0;
-            while (pos < end) {
-                unsigned int part = answer[pos++];
-                if (pos + part > end) break;
-                size_t copy = part;
-                if (used + copy >= outsz) copy = outsz - used - 1;
-                memcpy(out + used, answer + pos, copy);
-                used += copy;
-                pos += part;
-                if (used + 1 >= outsz) break;
-            }
-            out[used] = '\0';
-            return used > 0 ? 0 : -1;
-        }
-        off += rdlen;
-    }
-    return -1;
-}
-
-
-#endif
-
-static int lookup_asn_for_ip(const char *ip, char *out, size_t outsz) {
-    unsigned int a = 0, b = 0, c = 0, d = 0;
-    if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return -1;
-    char query[128];
-    snprintf(query, sizeof(query), "%u.%u.%u.%u.origin.asn.cymru.com", d, c, b, a);
-    char txt[512] = {0};
-    if (lookup_txt_first(query, txt, sizeof(txt)) != 0) return -1;
-    char *sep = strchr(txt, '|');
-    if (sep) * sep = '\0';
-    trim_line(txt);
-    if (!txt[0]) return -1;
-    snprintf(out, outsz, "%s", txt);
-    return 0;
-}
-
-static int lookup_as_name_for_asn(const char *asn, char *out, size_t outsz) {
-    char query[128];
-    snprintf(query, sizeof(query), "AS%s.asn.cymru.com", asn);
-    char txt[512] = {0};
-    if (lookup_txt_first(query, txt, sizeof(txt)) != 0) return -1;
-    char *last = NULL;
-    char *save = NULL;
-    for (char *tok = strtok_r(txt, "|", &save); tok; tok = strtok_r(NULL, "|", &save)) last = tok;
-    if (!last) return -1;
-    trim_line(last);
-    snprintf(out, outsz, "%s", last);
-    return 0;
-}
-
-static int carrier_from_asn(const char *asn, const char *as_name, char *out, size_t outsz) {
-    if (!asn || !out) return -1;
-    if (!strcmp(asn, "9808") || !strcmp(asn, "56040") || !strcmp(asn, "56041") || !strcmp(asn, "56042") || !strcmp(asn, "56044") ||
-            !strcmp(asn, "56046") || !strcmp(asn, "56047") || !strcmp(asn, "56048") || !strcmp(asn, "56050") || !strcmp(asn, "56052") ||
-            !strcmp(asn, "56055") || !strcmp(asn, "56056") || !strcmp(asn, "56057") || !strcmp(asn, "56058") || !strcmp(asn, "56059") ||
-            !strcmp(asn, "56060") || !strcmp(asn, "56061") || !strcmp(asn, "56062")) {
-        snprintf(out, outsz, "mobile");
-        return 0;
-    }
-    if (!strcmp(asn, "4134") || !strcmp(asn, "4809") || !strcmp(asn, "4812") || !strcmp(asn, "4816") || !strcmp(asn, "4811") ||
-            !strcmp(asn, "4813") || !strcmp(asn, "4815") || !strcmp(asn, "23724") || !strcmp(asn, "134756")) {
-        snprintf(out, outsz, "telecom");
-        return 0;
-    }
-    if (!strcmp(asn, "4837") || !strcmp(asn, "4808") || !strcmp(asn, "9929") || !strcmp(asn, "10099") || !strcmp(asn, "17621") ||
-            !strcmp(asn, "136958") || !strcmp(asn, "140717")) {
-        snprintf(out, outsz, "unicom");
-        return 0;
-    }
-    char upper[256] = {0};
-    if (as_name) {
-        snprintf(upper, sizeof(upper), "%s", as_name);
-        for (size_t i = 0; upper[i]; i++) if (upper[i] >= 'a' && upper[i] <= 'z') upper[i] = (char)(upper[i] - 32);
-    }
-    if (strstr(upper, "MOBILE") || strstr(upper, "CMNET") || strstr(upper, "CMCC") || strstr(upper, "CHINAMOBILE")) {
-        snprintf(out, outsz, "mobile");
-        return 0;
-    }
-    if (strstr(upper, "TELECOM") || strstr(upper, "CHINANET") || strstr(upper, "CHINA NET") || strstr(upper, "CN2")) {
-        snprintf(out, outsz, "telecom");
-        return 0;
-    }
-    if (strstr(upper, "UNICOM") || strstr(upper, "CHINA169") || strstr(upper, "CNCGROUP") || strstr(upper, "NETCOM")) {
-        snprintf(out, outsz, "unicom");
-        return 0;
-    }
-    return -1;
 }
 
 static int baidu_pool_add(BaiduProxyPool *pool, const char *addr) {
@@ -1369,107 +1086,42 @@ static socket_t dial_target_with_proxy(const char *ip, int port, int timeout_ms,
     return fd;
 }
 
-static int parse_carrier_listens(const char *raw, CarrierListenSpec **out_specs, size_t *out_len) {
+static int parse_listen_modes(const Config *cfg, CarrierListenSpec **out_specs, size_t *out_len) {
     *out_specs = NULL;
     *out_len = 0;
-    if (!raw || !*raw) return 0;
-    char *tmp = strdup(raw);
-    if (!tmp) return -1;
-    size_t cap = 4, len = 0;
-    CarrierListenSpec *specs = calloc(cap, sizeof(CarrierListenSpec));
-    if (!specs) {
-        free(tmp);
-        return -1;
-    }
-    char *save = NULL;
-    for (char *part = strtok_r(tmp, ",", &save); part; part = strtok_r(NULL, ",", &save)) {
-        trim_line(part);
-        if (!*part) continue;
-        char *eq = strchr(part, '=');
-        if (!eq) {
-            free(specs);
-            free(tmp);
-            return -1;
-        }
-        *eq = '\0';
-        if (len == cap) {
-            cap *= 2;
-            CarrierListenSpec *ns = realloc(specs, cap * sizeof(CarrierListenSpec));
-            if (!ns) {
-                free(specs);
-                free(tmp);
-                return -1;
-            }
-            specs = ns;
-        }
-        if (normalize_carrier(part, specs[len].carrier, sizeof(specs[len].carrier)) != 0) {
-            free(specs);
-            free(tmp);
-            return -1;
-        }
-        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", eq + 1);
+    if (!cfg) return -1;
+    size_t len = 0;
+    CarrierListenSpec *specs = calloc(2, sizeof(CarrierListenSpec));
+    if (!specs) return -1;
+
+    if (cfg->direct_listen[0] && cfg->baidu_listen[0] && strcmp(cfg->direct_listen, cfg->baidu_listen) == 0) {
+        // 两个监听地址一样，使用混合模式
+        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "mixed");
+        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->direct_listen);
+        specs[len].use_baidu_proxy = 2; // 2 表示混合模式
         len++;
+    } else {
+        if (cfg->direct_listen[0]) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct");
+            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->direct_listen);
+            specs[len].use_baidu_proxy = 0;
+            len++;
+        }
+        if (cfg->baidu_listen[0]) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "baidu");
+            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->baidu_listen);
+            specs[len].use_baidu_proxy = 1;
+            len++;
+        }
     }
-    free(tmp);
+
+    if (len == 0) {
+        free(specs);
+        return 0;
+    }
     *out_specs = specs;
     *out_len = len;
     return 0;
-}
-
-static int parse_carrier_resolvers(const char *raw, CarrierResolverSpec **out_specs, size_t *out_len) {
-    *out_specs = NULL;
-    *out_len = 0;
-    if (!raw || !*raw) return 0;
-    char *tmp = strdup(raw);
-    if (!tmp) return -1;
-    size_t cap = 4, len = 0;
-    CarrierResolverSpec *specs = calloc(cap, sizeof(CarrierResolverSpec));
-    if (!specs) {
-        free(tmp);
-        return -1;
-    }
-    char *save = NULL;
-    for (char *part = strtok_r(tmp, ",", &save); part; part = strtok_r(NULL, ",", &save)) {
-        trim_line(part);
-        if (!*part) continue;
-        char *eq = strchr(part, '=');
-        if (!eq) {
-            free(specs);
-            free(tmp);
-            return -1;
-        }
-        *eq = '\0';
-        if (len == cap) {
-            cap *= 2;
-            CarrierResolverSpec *ns = realloc(specs, cap * sizeof(CarrierResolverSpec));
-            if (!ns) {
-                free(specs);
-                free(tmp);
-                return -1;
-            }
-            specs = ns;
-        }
-        if (normalize_carrier(part, specs[len].carrier, sizeof(specs[len].carrier)) != 0) {
-            free(specs);
-            free(tmp);
-            return -1;
-        }
-        char *save2 = NULL;
-        for (char *tok = strtok_r(eq + 1, "|", &save2); tok && specs[len].len < 16; tok = strtok_r(NULL, "|", &save2)) {
-            trim_line(tok);
-            snprintf(specs[len].addrs[specs[len].len++], sizeof(specs[len].addrs[0]), "%s", tok);
-        }
-        len++;
-    }
-    free(tmp);
-    *out_specs = specs;
-    *out_len = len;
-    return 0;
-}
-
-static CarrierResolverSpec *find_resolver_spec(CarrierResolverSpec *specs, size_t len, const char *carrier) {
-    for (size_t i = 0; i < len; i++) if (str_eq_ci(specs[i].carrier, carrier)) return &specs[i];
-    return NULL;
 }
 
 static int resolve_host_ips(const char *domain, StringList *out) {
@@ -1487,25 +1139,12 @@ static int resolve_host_ips(const char *domain, StringList *out) {
     return out->len > 0 ? 0 : -1;
 }
 
-static int build_baidu_pool_for_carrier(BaiduProxyPool *pool, const char *carrier, CarrierResolverSpec *resolver_specs, size_t resolver_len) {
+static int build_baidu_pool_for_carrier(BaiduProxyPool *pool, const char *name) {
     memset(pool, 0, sizeof(*pool));
-    snprintf(pool->name, sizeof(pool->name), "%s", carrier ? carrier : "default");
+    snprintf(pool->name, sizeof(pool->name), "%s", name ? name : "default");
     StringList ips = {0};
-    resolve_host_ips(g_cfg.baidu_domain, &ips);
-    CarrierResolverSpec *spec = find_resolver_spec(resolver_specs, resolver_len, carrier);
-    (void)spec;
+    if (resolve_host_ips(g_cfg.baidu_domain, &ips) != 0) return -1;
     for (size_t i = 0; i < ips.len; i++) {
-        char asn[64] = {
-            0
-        }
-        , as_name[256] = {
-            0
-        }
-        , mapped[MAX_NAME_LEN] = {0};
-        if (lookup_asn_for_ip(ips.items[i], asn, sizeof(asn)) != 0) continue;
-        lookup_as_name_for_asn(asn, as_name, sizeof(as_name));
-        if (carrier_from_asn(asn, as_name, mapped, sizeof(mapped)) != 0) continue;
-        if (carrier && *carrier && !str_eq_ci(mapped, carrier)) continue;
         char addr[MAX_ADDR_LEN];
         snprintf(addr, sizeof(addr), "%s:%d", ips.items[i], g_cfg.baidu_port);
         int latency = 0;
@@ -1655,8 +1294,8 @@ static int set_current_candidate(size_t idx);
 #define CACHE_QUICK_CHECK_COUNT 5
 
 static const char *candidate_cache_file(void) {
-    if (g_cfg.ips_type == 6) return g_cfg.use_baidu_proxy ? "cfnat-cache-v6-baidu.txt" : "cfnat-cache-v6.txt";
-    return g_cfg.use_baidu_proxy ? "cfnat-cache-v4-baidu.txt" : "cfnat-cache-v4.txt";
+    if (g_cfg.ips_type == 6) return "cfnat-cache-v6.txt";
+    return "cfnat-cache-v4.txt";
 }
 
 static void save_candidate_cache(const char *path, const Result *items, size_t len) {
@@ -2074,21 +1713,50 @@ static void *connection_thread(void *arg) {
     conn_msg("识别客户端协议: %s，转发到 IP: %s 端口: %d", is_tls ? "TLS" : "非 TLS", cc->ip, target_port);
     socket_t upstream = INVALID_SOCKET;
     int best = 0;
-    for (int i = 0; i < cc->num; i++) {
-        int lat = 0;
-        socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
-        if (cfnat_socket_valid(fd)) {
-            upstream = fd;
-            best = lat;
-            break;
+
+    if (cc->use_mixed) {
+        // 混合模式：先直连，不行再试百度前置
+        for (int i = 0; i < cc->num; i++) {
+            int lat = 0;
+            socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, NULL, &lat);
+            if (cfnat_socket_valid(fd)) {
+                upstream = fd;
+                best = lat;
+                conn_msg("选择连接: 地址: %s:%d 延迟: %d ms (直连)", cc->ip, target_port, best);
+                break;
+            }
+        }
+        if (cfnat_socket_invalid(upstream) && cc->proxy_pool) {
+            for (int i = 0; i < cc->num; i++) {
+                int lat = 0;
+                socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
+                if (cfnat_socket_valid(fd)) {
+                    upstream = fd;
+                    best = lat;
+                    conn_msg("选择连接: 地址: %s:%d 延迟: %d ms (百度前置)", cc->ip, target_port, best);
+                    break;
+                }
+            }
+        }
+    } else {
+        // 普通模式
+        for (int i = 0; i < cc->num; i++) {
+            int lat = 0;
+            socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
+            if (cfnat_socket_valid(fd)) {
+                upstream = fd;
+                best = lat;
+                conn_msg("选择连接: 地址: %s:%d 延迟: %d ms", cc->ip, target_port, best);
+                break;
+            }
         }
     }
+
     if (cfnat_socket_invalid(upstream)) {
         debug_msg("未找到符合延迟要求的连接，关闭客户端连接");
         goto out;
     }
     send(upstream, (const char *) & first, 1, 0);
-    conn_msg("选择连接: 地址: %s:%d 延迟: %d ms", cc->ip, target_port, best);
     relay_bidirectional(client, upstream);
     close(upstream);
     out : close(client);
@@ -2100,14 +1768,35 @@ static void *connection_thread(void *arg) {
 
 static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     if (!rt || !ip || !*ip) return 0;
+    // 混合模式：先试直连，不行再试百度代理
+    if (rt->spec.use_baidu_proxy == 2) {
+        int latency = 0;
+        socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, NULL, &latency);
+        if (cfnat_socket_valid(fd)) {
+            close(fd);
+            debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
+            return 1;
+        }
+        if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+            fd = dial_target_with_proxy(ip, g_cfg.port, 2000, rt->proxy_pool, &latency);
+            if (cfnat_socket_valid(fd)) {
+                close(fd);
+                debug_msg("%s 健康检查成功(百度前置): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
+                return 1;
+            }
+        }
+        debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
+        return 0;
+    }
+    // 普通模式
     int latency = 0;
     socket_t fd = dial_target_with_proxy(ip, g_cfg.port, 2000, rt->proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
-        debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.carrier), ip);
+        debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
         return 0;
     }
     close(fd);
-    debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.carrier), ip, latency);
+    debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
     return 1;
 }
 
@@ -2132,7 +1821,7 @@ static int carrier_select_valid_ip(CarrierRuntime *rt) {
     for (size_t i = 0; i < rt->candidates.len; i++) {
         if (carrier_health_check_ip(rt, rt->candidates.items[i].ip)) {
             carrier_set_current_candidate(rt, i);
-            log_msg("%s 可用 IP: %s (健康检查端口:%d)", carrier_display_name(rt->spec.carrier), rt->candidates.items[i].ip, g_cfg.port);
+            log_msg("%s 可用 IP: %s (健康检查端口:%d)", carrier_display_name(rt->spec.mode), rt->candidates.items[i].ip, g_cfg.port);
             return 1;
         }
     }
@@ -2147,7 +1836,7 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
     for (size_t i = start; i < rt->candidates.len; i++) {
         if (carrier_health_check_ip(rt, rt->candidates.items[i].ip)) {
             carrier_set_current_candidate(rt, i);
-            log_msg("%s 切换到下一个最优 IP: %s 候选索引: %zu", carrier_display_name(rt->spec.carrier), rt->candidates.items[i].ip, i);
+            log_msg("%s 切换到下一个最优 IP: %s 候选索引: %zu", carrier_display_name(rt->spec.mode), rt->candidates.items[i].ip, i);
             return 1;
         }
     }
@@ -2182,25 +1871,57 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
         if (!atomic_load(&g_running)) return 0;
         StringList ips = load_ip_list(ipfile, g_cfg.random_mode);
         if (ips.len == 0) {
-            warn_msg("%s 没有可扫描的 IP，3 秒后重试", carrier_display_name(rt->spec.carrier));
+            warn_msg("%s 没有可扫描的 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
             if (sleep_interruptible_ms(3000) != 0) return 0;
             continue;
         }
-        ResultList results = scan_ips(&ips, &g_cfg, rt->proxy_pool);
+        ResultList results = {0};
+        if (rt->spec.use_baidu_proxy == 2) {
+            // 混合模式重扫描
+            ResultList results_direct = scan_ips(&ips, &g_cfg, NULL);
+            ResultList results_baidu = {0};
+            if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+                results_baidu = scan_ips(&ips, &g_cfg, rt->proxy_pool);
+            }
+            pthread_mutex_init(&results.mu, NULL);
+            for (size_t j = 0; j < results_direct.len; j++) {
+                resultlist_add(&results, &results_direct.items[j]);
+            }
+            for (size_t j = 0; j < results_baidu.len; j++) {
+                int exists = 0;
+                for (size_t k = 0; k < results.len; k++) {
+                    if (strcmp(results.items[k].ip, results_baidu.items[j].ip) == 0) {
+                        exists = 1;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    resultlist_add(&results, &results_baidu.items[j]);
+                }
+            }
+            free(results_direct.items);
+            free(results_baidu.items);
+            if (results.len > 0) {
+                qsort(results.items, results.len, sizeof(Result), cmp_result);
+            }
+        } else {
+            // 普通模式重扫描
+            results = scan_ips(&ips, &g_cfg, rt->proxy_pool);
+        }
         strlist_free(&ips);
         if (results.len == 0) {
-            warn_msg("%s 重新扫描后仍未发现有效 IP，3 秒后重试", carrier_display_name(rt->spec.carrier));
+            warn_msg("%s 重新扫描后仍未发现有效 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
             if (sleep_interruptible_ms(3000) != 0) return 0;
             continue;
         }
         rt->candidates.items = results.items;
         rt->candidates.len = results.len;
-        log_msg("%s 重新扫描得到 %zu 个候选 IP", carrier_display_name(rt->spec.carrier), rt->candidates.len);
+        log_msg("%s 重新扫描得到 %zu 个候选 IP", carrier_display_name(rt->spec.mode), rt->candidates.len);
         if (carrier_select_valid_ip(rt)) return 1;
         free(results.items);
         rt->candidates.items = NULL;
         rt->candidates.len = 0;
-        warn_msg("%s 重新扫描得到的候选 IP 健康检查均失败，3 秒后重试", carrier_display_name(rt->spec.carrier));
+        warn_msg("%s 重新扫描得到的候选 IP 健康检查均失败，3 秒后重试", carrier_display_name(rt->spec.mode));
         if (sleep_interruptible_ms(3000) != 0) return 0;
     }
 }
@@ -2215,19 +1936,19 @@ static void *carrier_health_thread(void *arg) {
         carrier_get_current_ip(rt, ip, sizeof(ip));
         if (!ip[0] || !carrier_health_check_ip(rt, ip)) {
             fail++;
-            log_msg("%s 状态检查失败 (%d/2): 当前 IP %s 暂不可用", carrier_display_name(rt->spec.carrier), fail, ip[0] ? ip : "为空");
+            log_msg("%s 状态检查失败 (%d/2): 当前 IP %s 暂不可用", carrier_display_name(rt->spec.mode), fail, ip[0] ? ip : "为空");
         } else {
             fail = 0;
             long n = now_ms();
             if (g_cfg.health_log > 0 && n - last >= g_cfg.health_log * 1000L) {
-                log_msg("%s 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.carrier), ip);
+                log_msg("%s 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.mode), ip);
                 last = n;
             }
         }
         if (fail >= 2) {
-            log_msg("%s 连续两次状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.carrier));
+            log_msg("%s 连续两次状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_ip(rt)) {
-                log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.carrier));
+                log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
                 if (!carrier_rescan_and_select_ip(rt, g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt")) {
                     atomic_store(&g_running, 0);
                     return NULL;
@@ -2268,7 +1989,7 @@ static void *carrier_accept_thread(void *arg) {
             continue;
         }
         int active = atomic_fetch_add(&g_active_connections, 1) + 1;
-        conn_msg("%s 客户端连接建立，当前活跃连接数: %d", carrier_display_name(rt->spec.carrier), active);
+        conn_msg("%s 客户端连接建立，当前活跃连接数: %d", carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
             close(cfd);
@@ -2282,6 +2003,7 @@ static void *carrier_accept_thread(void *arg) {
         cc->num = g_cfg.num;
         cc->delay_ms = g_cfg.delay_ms;
         cc->proxy_pool = rt->proxy_pool;
+        cc->use_mixed = (rt->spec.use_baidu_proxy == 2) ? 1 : 0;
         pthread_t tid;
         create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
@@ -2302,7 +2024,12 @@ static int parse_addr(const char *addr, char *host, size_t hostsz, int *port) {
         return *port > 0 ? 0 : -1;
     }
     const char *colon = strrchr(addr, ':');
-    if (!colon) return -1;
+    if (!colon) {
+        // 只有端口号的情况，例如 "1234"
+        snprintf(host, hostsz, "0.0.0.0");
+        *port = atoi(addr);
+        return *port > 0 ? 0 : -1;
+    }
     size_t n = (size_t)(colon - addr);
     if (n >= hostsz) n = hostsz - 1;
     memcpy(host, addr, n);
@@ -2317,46 +2044,61 @@ static socket_t listen_tcp(const char *addr) {
     int port = 0;
     if (parse_addr(addr, host, sizeof(host), &port) != 0) return INVALID_SOCKET;
     int yes = 1;
+    
     if (strchr(host, ':')) {
         socket_t fd = socket(AF_INET6, SOCK_STREAM, 0);
         if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
+#endif
         struct sockaddr_in6 sa6;
         memset(&sa6, 0, sizeof(sa6));
         sa6.sin6_family = AF_INET6;
         sa6.sin6_port = htons((uint16_t)port);
         if (inet_pton(AF_INET6, host, &sa6.sin6_addr) != 1) {
             close(fd);
-            return -1;
+            return INVALID_SOCKET;
         }
         if (bind(fd, (struct sockaddr *)&sa6, sizeof(sa6)) != 0) {
+            int err = errno;
             close(fd);
-            return -1;
+            errno = err;
+            return INVALID_SOCKET;
         }
         if (listen(fd, 1024) != 0) {
+            int err = errno;
             close(fd);
-            return -1;
+            errno = err;
+            return INVALID_SOCKET;
         }
         return fd;
     }
     socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
+#endif
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
         close(fd);
-        return -1;
+        return INVALID_SOCKET;
     }
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        int err = errno;
         close(fd);
-        return -1;
+        errno = err;
+        return INVALID_SOCKET;
     }
     if (listen(fd, 1024) != 0) {
+        int err = errno;
         close(fd);
-        return -1;
+        errno = err;
+        return INVALID_SOCKET;
     }
     return fd;
 }
@@ -2449,9 +2191,6 @@ int main(int argc, char **argv) {
     }
 #endif
     parse_args(&g_cfg, argc, argv);
-    if (g_cfg.carrier_listens[0]) {
-        log_msg("检测到 -carrier-listens，已自动启用 -baidu-proxy=true，运营商分池以分端口入口为准");
-    }
     install_signals();
     const char *ipfile = g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt";
     const char **urls = g_cfg.ips_type == 6 ? IPS_V6_URLS : IPS_V4_URLS;
@@ -2464,79 +2203,117 @@ int main(int argc, char **argv) {
     log_msg("locations 加载完成: %zu 条", g_location_count);
     CarrierListenSpec *carrier_specs = NULL;
     size_t carrier_spec_len = 0;
-    CarrierResolverSpec *resolver_specs = NULL;
-    size_t resolver_spec_len = 0;
-    if (parse_carrier_listens(g_cfg.carrier_listens, &carrier_specs, &carrier_spec_len) != 0) {
-        log_msg("解析 -carrier-listens 失败");
+    if (parse_listen_modes(&g_cfg, &carrier_specs, &carrier_spec_len) != 0) {
+        log_msg("解析 -direct-listen / -baidu-listen 失败");
         free(g_locations);
         return 1;
-    }
-    if (parse_carrier_resolvers(g_cfg.carrier_resolvers, &resolver_specs, &resolver_spec_len) != 0) {
-        log_msg("解析 -carrier-resolvers 失败");
-        free(carrier_specs);
-        free(g_locations);
-        return 1;
-    }
-    if (g_cfg.use_baidu_proxy) {
-        if (build_baidu_pool_for_carrier(&g_default_proxy_pool, NULL, resolver_specs, resolver_spec_len) == 0) {
-            log_msg("默认百度代理池已建立，节点数: %zu", g_default_proxy_pool.len);
-        } else {
-            warn_msg("默认百度代理池建立失败，回退为直连拨号");
-        }
     }
     StringList ips = load_ip_list(ipfile, g_cfg.random_mode);
     if (ips.len == 0) {
         log_msg("没有可扫描的 IP");
-        free(resolver_specs);
         free(carrier_specs);
         baidu_pool_free(&g_default_proxy_pool);
         free(g_locations);
         return 1;
     }
     if (carrier_spec_len > 0) {
+        size_t started_count = 0;
         g_carrier_runtimes = calloc(carrier_spec_len, sizeof(CarrierRuntime));
         if (!g_carrier_runtimes) {
             strlist_free(&ips);
-            free(resolver_specs);
             free(carrier_specs);
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
 #ifdef _WIN32
-        #ifdef _WIN32
-    WSACleanup();
-#endif
+            WSACleanup();
 #endif
             return 1;
         }
         g_carrier_runtime_count = carrier_spec_len;
-        log_msg("运营商分池模式启动，监听器数量: %zu", carrier_spec_len);
+        log_msg("双方案监听模式启动，监听器数量: %zu", carrier_spec_len);
         for (size_t i = 0; i < carrier_spec_len; i++) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
             rt->listen_fd = INVALID_SOCKET;
             rt->spec = carrier_specs[i];
             pthread_mutex_init(&rt->candidates.mu, NULL);
-            if (g_cfg.use_baidu_proxy) {
+
+            ResultList carrier_results = {0};
+            if (rt->spec.use_baidu_proxy == 2) {
+                // 混合模式：同时用直连和百度扫描，合并结果
                 rt->proxy_pool = calloc(1, sizeof(BaiduProxyPool));
-                if (rt->proxy_pool && build_baidu_pool_for_carrier(rt->proxy_pool, rt->spec.carrier, resolver_specs, resolver_spec_len) == 0) {
-                    log_msg("%s 百度代理池已建立，节点数: %zu", carrier_display_name(rt->spec.carrier), rt->proxy_pool->len);
+                if (rt->proxy_pool && build_baidu_pool_for_carrier(rt->proxy_pool, rt->spec.mode) == 0) {
+                    log_msg("%s 百度代理池已建立，节点数: %zu", carrier_display_name(rt->spec.mode), rt->proxy_pool->len);
                 } else {
                     if (rt->proxy_pool) {
                         baidu_pool_free(rt->proxy_pool);
                         free(rt->proxy_pool);
                     }
                     rt->proxy_pool = NULL;
-                    warn_msg("%s 百度代理池建立失败，回退为直连拨号", carrier_display_name(rt->spec.carrier));
+                    warn_msg("%s 百度代理池建立失败，只使用直连扫描", carrier_display_name(rt->spec.mode));
                 }
+
+                // 先直连扫描
+                ResultList results_direct = scan_ips(&ips, &g_cfg, NULL);
+                // 再百度前置扫描（如果有百度代理池的话）
+                ResultList results_baidu = {0};
+                if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+                    results_baidu = scan_ips(&ips, &g_cfg, rt->proxy_pool);
+                }
+
+                // 合并结果，去重
+                pthread_mutex_init(&carrier_results.mu, NULL);
+                // 先加直连的
+                for (size_t j = 0; j < results_direct.len; j++) {
+                    resultlist_add(&carrier_results, &results_direct.items[j]);
+                }
+                // 再加百度的，跳过重复 IP
+                for (size_t j = 0; j < results_baidu.len; j++) {
+                    int exists = 0;
+                    for (size_t k = 0; k < carrier_results.len; k++) {
+                        if (strcmp(carrier_results.items[k].ip, results_baidu.items[j].ip) == 0) {
+                            exists = 1;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        resultlist_add(&carrier_results, &results_baidu.items[j]);
+                    }
+                }
+                // 释放临时结果
+                free(results_direct.items);
+                free(results_baidu.items);
+
+                // 对合并后的结果排序
+                if (carrier_results.len > 0) {
+                    qsort(carrier_results.items, carrier_results.len, sizeof(Result), cmp_result);
+                }
+            } else {
+                // 普通模式
+                if (rt->spec.use_baidu_proxy) {
+                    rt->proxy_pool = calloc(1, sizeof(BaiduProxyPool));
+                    if (rt->proxy_pool && build_baidu_pool_for_carrier(rt->proxy_pool, rt->spec.mode) == 0) {
+                        log_msg("%s 百度代理池已建立，节点数: %zu", carrier_display_name(rt->spec.mode), rt->proxy_pool->len);
+                    } else {
+                        if (rt->proxy_pool) {
+                            baidu_pool_free(rt->proxy_pool);
+                            free(rt->proxy_pool);
+                        }
+                        rt->proxy_pool = NULL;
+                        warn_msg("%s 百度代理池建立失败，跳过此监听", carrier_display_name(rt->spec.mode));
+                        continue;
+                    }
+                }
+                carrier_results = scan_ips(&ips, &g_cfg, rt->proxy_pool);
             }
-            ResultList carrier_results = scan_ips(&ips, &g_cfg, rt->proxy_pool);
+
             if (carrier_results.len == 0) {
-                warn_msg("%s 未扫描到可用候选 IP", carrier_display_name(rt->spec.carrier));
+                warn_msg("%s 未扫描到可用候选 IP", carrier_display_name(rt->spec.mode));
                 continue;
             }
             rt->candidates.items = carrier_results.items;
             rt->candidates.len = carrier_results.len;
             if (!carrier_select_valid_ip(rt)) {
-                warn_msg("%s 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.carrier));
+                warn_msg("%s 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
                 free(rt->candidates.items);
                 rt->candidates.items = NULL;
                 rt->candidates.len = 0;
@@ -2544,19 +2321,38 @@ int main(int argc, char **argv) {
             }
             rt->listen_fd = listen_tcp(rt->spec.addr);
             if (cfnat_socket_invalid(rt->listen_fd)) {
-                log_msg("无法监听 %s(%s): %s", carrier_display_name(rt->spec.carrier), rt->spec.addr, strerror(errno));
+                log_msg("无法监听 %s(%s): %s", carrier_display_name(rt->spec.mode), rt->spec.addr, strerror(errno));
                 free(rt->candidates.items);
                 rt->candidates.items = NULL;
                 rt->candidates.len = 0;
                 continue;
             }
-            log_msg("%s 正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s", carrier_display_name(rt->spec.carrier), rt->spec.addr, g_cfg.port, g_cfg.http_port, g_cfg.num, g_cfg.delay_ms, g_cfg.log_name);
+            log_msg("%s 正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s", carrier_display_name(rt->spec.mode), rt->spec.addr, g_cfg.port, g_cfg.http_port, g_cfg.num, g_cfg.delay_ms, g_cfg.log_name);
             create_small_thread(&rt->health_tid, carrier_health_thread, rt);
             create_small_thread(&rt->accept_tid, carrier_accept_thread, rt);
+            started_count++;
         }
         strlist_free(&ips);
-        free(resolver_specs);
         free(carrier_specs);
+        if (started_count == 0) {
+            for (size_t i = 0; i < g_carrier_runtime_count; i++) {
+                CarrierRuntime *rt = &g_carrier_runtimes[i];
+                free(rt->candidates.items);
+                pthread_mutex_destroy(&rt->candidates.mu);
+                if (rt->proxy_pool) {
+                    baidu_pool_free(rt->proxy_pool);
+                    free(rt->proxy_pool);
+                }
+            }
+            free(g_carrier_runtimes);
+            g_carrier_runtimes = NULL;
+            g_carrier_runtime_count = 0;
+            baidu_pool_free(&g_default_proxy_pool);
+            free(g_locations);
+            g_locations = NULL;
+            g_location_count = 0;
+            return 1;
+        }
         while (atomic_load(&g_running)) {
             if (sleep_interruptible_ms(1000) != 0) break;
         }
@@ -2590,45 +2386,10 @@ int main(int argc, char **argv) {
         g_location_count = 0;
         return 0;
     }
-    long start = 0;
-    ResultList results = {0};
-    int used_cache = try_use_candidate_cache(g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL, &results);
-    for (;;) {
-        if (used_cache) break;
-        start = now_ms();
-        results = scan_ips(&ips, &g_cfg, g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL);
-        if (results.len > 0) {
-            save_candidate_cache(candidate_cache_file(), results.items, results.len);
-            break;
-        }
-        warn_msg("未发现有效IP，可尝试放宽 -delay 或提高 -log=debug 查看细节，3 秒后重试");
-        if (!atomic_load(&g_running)) {
-            strlist_free(&ips);
-            free(resolver_specs);
-            free(carrier_specs);
-            baidu_pool_free(&g_default_proxy_pool);
-            free(g_locations);
-#ifdef _WIN32
-        #ifdef _WIN32
-    WSACleanup();
-#endif
-#endif
-            return 0;
-        }
-        if (sleep_interruptible_ms(3000) != 0) {
-            strlist_free(&ips);
-            free(resolver_specs);
-            free(carrier_specs);
-            baidu_pool_free(&g_default_proxy_pool);
-            free(g_locations);
-#ifdef _WIN32
-        #ifdef _WIN32
-    WSACleanup();
-#endif
-#endif
-            return 0;
-        }
-    }
+    long start = now_ms();
+    ResultList results = scan_ips(&ips, &g_cfg, NULL);
+    strlist_free(&ips);
+    free(carrier_specs);
     printf("候选池统计\n");
     printf("候选总数: %zu\n", results.len);
     printf("IP 地址 | 数据中心 | 地区 | 城市 | 延迟 | 丢包 | 探测成功\n");
@@ -2640,92 +2401,7 @@ int main(int argc, char **argv) {
         printf("最佳丢包率: %d%%\n", results.items[0].loss_rate);
         explain_selected_result(&results.items[0]);
     }
-    g_candidates = results.items;
-    g_candidate_count = results.len;
-    if (!select_valid_ip(g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL)) {
-        log_msg("没有有效的 IP 可用");
-        strlist_free(&ips);
-        free(resolver_specs);
-        free(carrier_specs);
-        free(results.items);
-        baidu_pool_free(&g_default_proxy_pool);
-        free(g_locations);
-        return 1;
-    }
-    strlist_free(&ips);
-    free(resolver_specs);
-    free(carrier_specs);
-    socket_t lfd = listen_tcp(g_cfg.addr);
-    if (cfnat_socket_invalid(lfd)) {
-#ifdef _WIN32
-        log_msg("无法监听 %s: WSA error %d", g_cfg.addr, WSAGetLastError());
-#else
-        log_msg("无法监听 %s: %s", g_cfg.addr, strerror(errno));
-#endif
-        free(results.items);
-        baidu_pool_free(&g_default_proxy_pool);
-        free(g_locations);
-        return 1;
-    }
-    g_listen_fd = lfd;
-    log_msg("正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s", g_cfg.addr, g_cfg.port, g_cfg.http_port, g_cfg.num, g_cfg.delay_ms, g_cfg.log_name);
-    pthread_t ht;
-    pthread_t rt;
-    RefreshCtx refresh_ctx = { .proxy_pool = g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL };
-    create_small_thread(&ht, health_thread, g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL);
-    create_small_thread(&rt, refresh_thread, &refresh_ctx);
-    while (atomic_load(&g_running)) {
-        struct sockaddr_storage ss;
-#ifdef _WIN32
-        int slen = (int)sizeof(ss);
-#else
-        socklen_t slen = sizeof(ss);
-#endif
-        socket_t cfd = accept_interruptible(lfd, (struct sockaddr *)&ss, &slen);
-        if (cfnat_socket_invalid(cfd)) {
-            if (!atomic_load(&g_running)) break;
-#ifdef _WIN32
-            {
-                int e = WSAGetLastError();
-                if (e == WSAEINTR || e == WSAENOTSOCK) break;
-            }
-#else
-            if (errno == EINTR || errno == EBADF) break;
-#endif
-            if (sleep_interruptible_ms(1000) != 0) break;
-            continue;
-        }
-        char ip[MAX_IP_LEN];
-        if (!choose_ip_for_connection(ip, sizeof(ip), g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL)) {
-            close(cfd);
-            continue;
-        }
-        int active = atomic_fetch_add(&g_active_connections, 1) + 1;
-        conn_msg("客户端连接建立，当前活跃连接数: %d", active);
-        ConnCtx *cc = calloc(1, sizeof(ConnCtx));
-        if (!cc) {
-            close(cfd);
-            atomic_fetch_sub(&g_active_connections, 1);
-            continue;
-        }
-        cc->client_fd = cfd;
-        snprintf(cc->ip, sizeof(cc->ip), "%s", ip);
-        cc->tls_port = g_cfg.port;
-        cc->http_port = g_cfg.http_port;
-        cc->num = g_cfg.num;
-        cc->delay_ms = g_cfg.delay_ms;
-        cc->proxy_pool = g_cfg.use_baidu_proxy ? &g_default_proxy_pool : NULL;
-        pthread_t tid;
-        create_small_thread(&tid, connection_thread, cc);
-        pthread_detach(tid);
-    }
-    if (cfnat_socket_valid(lfd)) close(lfd);
-    g_listen_fd = INVALID_SOCKET;
-    pthread_join(ht, NULL);
-    pthread_join(rt, NULL);
     free(results.items);
-    g_candidates = NULL;
-    g_candidate_count = 0;
     baidu_pool_free(&g_default_proxy_pool);
     free(g_locations);
     g_locations = NULL;
